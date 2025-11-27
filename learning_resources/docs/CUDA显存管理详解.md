@@ -17,9 +17,156 @@ PyTorch 使用 **CUDACachingAllocator**（缓存分配器）来管理 GPU 显存
 - C++ 核心实现: `c10/cuda/CUDACachingAllocator.cpp`
 - 头文件: `c10/cuda/CUDACachingAllocator.h`
 
+### 1.1 架构总览图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Python 层 (torch.cuda)                       │
+│  torch.empty()  caching_allocator_alloc()  memory_stats()           │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ torch._C._cuda_cudaCachingAllocator_*
+                             ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│              Python 绑定层 (torch/csrc/cuda/Module.cpp)             │
+│  THCPModule_cudaCachingAllocator_raw_alloc() - 释放GIL              │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ C++ API
+                             ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│             全局分配器 (NativeCachingAllocator)                      │
+│  • 管理所有GPU设备                                                   │
+│  • allocated_blocks: 全局Block索引 (67个分片hash map)               │
+│  • 统一入口: malloc() / free()                                       │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ 按设备分发
+                             ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│        设备分配器 (DeviceCachingAllocator) - 每个GPU一个             │
+│                                                                       │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐    │
+│  │  small_blocks   │  │  large_blocks   │  │  graph_pools    │    │
+│  │   (≤1MB)        │  │   (>1MB)        │  │  (CUDA Graph)   │    │
+│  │                 │  │                 │  │                 │    │
+│  │ [Block*池]      │  │ [Block*池]      │  │ [私有池]        │    │
+│  │ 按大小排序      │  │ 按大小排序      │  │ 隔离内存        │    │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘    │
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ active_blocks: 正在使用的Block集合                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ cuda_events: stream -> [(Event, Block*)]                    │   │
+│  │ 跨流使用的事件队列                                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ expandable_segments_: 可扩展段列表                          │   │
+│  │ 虚拟地址动态映射物理内存                                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                      底层内存管理                                    │
+│                                                                       │
+│  传统方式:                    可扩展段:                              │
+│  cudaMalloc()                cuMemAddressReserve()  (预留虚拟地址)  │
+│  cudaFree()                  cuMemCreate()          (创建物理内存)  │
+│                              cuMemMap()             (映射)           │
+│                              cuMemUnmap()           (解除映射)       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## 二、完整调用链路
+
+### 2.0 调用链路流程图
+
+```
+用户代码: torch.empty(1000, 1000, device='cuda')
+    │
+    ↓
+┌───────────────────────────────────────────────────────────────┐
+│ Python层: torch/cuda/memory.py                                │
+│ caching_allocator_alloc(size, device, stream)                 │
+│   • 处理默认参数 (device, stream)                             │
+│   • 转换stream对象为底层指针                                  │
+└───────────────────────────┬───────────────────────────────────┘
+                            │ torch._C._cuda_cudaCachingAllocator_raw_alloc
+                            ↓
+┌───────────────────────────────────────────────────────────────┐
+│ Python绑定: torch/csrc/cuda/Module.cpp                        │
+│ THCPModule_cudaCachingAllocator_raw_alloc()                   │
+│   • PyArg_ParseTuple: 解析Python参数                          │
+│   • pybind11::gil_scoped_release: 释放GIL                     │
+└───────────────────────────┬───────────────────────────────────┘
+                            │ C++ API
+                            ↓
+┌───────────────────────────────────────────────────────────────┐
+│ C++接口: c10/cuda/CUDACachingAllocator.cpp                    │
+│ raw_alloc_with_stream(nbytes, stream)                         │
+│   • 检查环境变量: PYTORCH_NO_CUDA_MEMORY_CACHING              │
+│   • 获取当前设备: GetDevice(&device)                          │
+│   • 分支: uncached_allocate() / malloc()                      │
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+                            ↓
+┌───────────────────────────────────────────────────────────────┐
+│ 全局分配器: NativeCachingAllocator::malloc()                  │
+│   • 查找设备分配器: device_allocator[device]                  │
+│   • 调用设备分配器的malloc                                    │
+│   • add_allocated_block: 注册到全局索引                       │
+│   • GPUTrace通知Python解释器                                  │
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+                            ↓
+┌───────────────────────────────────────────────────────────────┐
+│ 设备分配器: DeviceCachingAllocator::malloc()                  │
+│                                                                 │
+│  [1] process_events()         - 回收跨流完成的内存            │
+│       └─> 遍历cuda_events检查cudaEvent是否完成                │
+│                                                                 │
+│  [2] round_size()             - 对齐到512字节                  │
+│                                                                 │
+│  [3] get_pool()               - 选择内存池                     │
+│       ├─> 检查captures_underway (CUDA Graph?)                 │
+│       └─> 返回 small_blocks / large_blocks / graph_pool       │
+│                                                                 │
+│  [4] get_free_block()         - 从缓存池查找                   │
+│       ├─> lower_bound: 查找>=size的最小块                     │
+│       ├─> 检查stream匹配                                       │
+│       └─> 避免浪费过大的块                                     │
+│                                                                 │
+│  [5] 缓存未命中:                                               │
+│       ├─> garbage_collect_cached_blocks()  (GC)               │
+│       ├─> alloc_block()                                        │
+│       │    ├─> cudaMallocMaybeCapturing()  (传统)             │
+│       │    └─> try_allocate_expandable_block() (可扩展)       │
+│       ├─> release_available_cached_blocks() (释放部分缓存)    │
+│       └─> release_cached_blocks() (释放所有缓存)              │
+│                                                                 │
+│  [6] OOM处理:                                                  │
+│       ├─> 尝试从私有池借用                                     │
+│       ├─> 调用OOM观察者                                        │
+│       └─> 抛出OutOfMemoryError                                │
+│                                                                 │
+│  [7] should_split()           - 拆分过大的块                   │
+│       └─> 创建remaining_block放回池                           │
+│                                                                 │
+│  [8] 标记分配:                                                 │
+│       ├─> block->allocated = true                             │
+│       ├─> active_blocks.insert(block)                         │
+│       ├─> 更新统计: stats.allocated_bytes                     │
+│       └─> record_trace(ALLOC)                                 │
+└───────────────────────────┬───────────────────────────────────┘
+                            │
+                            ↓ 返回block->ptr
+┌───────────────────────────────────────────────────────────────┐
+│ 用户获得GPU内存指针                                            │
+└───────────────────────────────────────────────────────────────┘
+```
 
 ### 2.1 Python 层接口
 
@@ -300,6 +447,110 @@ Block* malloc(size_t orig_size, cudaStream_t stream) {
 
 ## 三、关键数据结构
 
+### 3.0 数据结构关系图
+
+```
+NativeCachingAllocator (全局单例)
+│
+├─> device_allocator: vector<DeviceCachingAllocator*>
+│   └─> [GPU0, GPU1, GPU2, ...]
+│
+└─> allocated_blocks: 分片hash map (67个分片)
+    └─> {Block* -> void*} 查找分配块
+
+
+DeviceCachingAllocator (每个GPU设备一个)
+│
+├─> 内存池
+│   ├─> small_blocks: BlockPool
+│   │   ├─> blocks: set<Block*>  (按大小排序的空闲块)
+│   │   ├─> unmapped: set<Block*>  (未映射的虚拟地址块)
+│   │   └─> is_small = true
+│   │
+│   ├─> large_blocks: BlockPool
+│   │   ├─> blocks: set<Block*>
+│   │   ├─> unmapped: set<Block*>
+│   │   └─> is_small = false
+│   │
+│   └─> graph_pools: map<MempoolId_t, PrivatePool*>
+│       └─> [graph_id -> {small_blocks, large_blocks}]
+│
+├─> 活跃块管理
+│   └─> active_blocks: set<Block*>  (正在使用的块)
+│
+├─> 跨流同步
+│   └─> cuda_events: map<CUDAStream, deque<(Event, Block*)>>
+│       └─> [stream -> [(event1, block1), (event2, block2), ...]]
+│
+├─> 可扩展段
+│   └─> expandable_segments_: vector<ExpandableSegment*>
+│       └─> [segment1, segment2, ...]
+│
+├─> CUDA Graph支持
+│   ├─> captures_underway: vector<(MempoolId, filter)>  (捕获中的图)
+│   └─> deferred_blocks: map<Block*, vector<graphNode>>  (延迟释放)
+│
+└─> 统计与追踪
+    ├─> stats: DeviceStats  (内存统计)
+    ├─> alloc_buffer: RingBuffer<TraceEntry>  (历史追踪)
+    └─> oom_observers_: vector<callback>  (OOM回调)
+
+
+Block (内存块)
+├─> 基本信息
+│   ├─> ptr: void*                  (内存地址)
+│   ├─> size: size_t                (块大小)
+│   ├─> requested_size: size_t      (用户请求大小)
+│   ├─> device: DeviceIndex         (设备ID)
+│   └─> stream: cudaStream_t        (分配时的stream)
+│
+├─> 状态标记
+│   ├─> allocated: bool             (是否正在使用)
+│   ├─> mapped: bool                (是否映射了物理内存)
+│   └─> pool: BlockPool*            (所属内存池)
+│
+├─> 链表结构
+│   ├─> prev: Block*                (前一个块)
+│   └─> next: Block*                (后一个块)
+│
+├─> 跨流管理
+│   ├─> stream_uses: set<Stream>    (使用过的其他stream)
+│   └─> event_count: int            (未完成的事件数)
+│
+├─> 可扩展段
+│   └─> expandable_segment_: ExpandableSegment*
+│
+└─> 调试信息
+    ├─> context_when_allocated: GatheredContext*  (分配时堆栈)
+    └─> gc_count_base: int64_t                    (GC计数基准)
+
+
+ExpandableSegment (可扩展段)
+├─> 虚拟地址空间
+│   ├─> ptr_: CUdeviceptr           (虚拟地址起点)
+│   ├─> segment_size_: size_t       (每个段大小, 通常2MB)
+│   └─> max_handles_: size_t        (最大段数)
+│
+├─> 物理内存映射
+│   ├─> handles_: vector<optional<Handle>>  (每个段的物理内存句柄)
+│   │   └─> [handle0, handle1, nullopt, handle3, ...]
+│   └─> mapped_size_: size_t        (已映射的物理内存总大小)
+│
+├─> P2P支持
+│   └─> peers_: vector<DeviceIndex> (可访问的其他GPU)
+│
+└─> 所属信息
+    ├─> device_: DeviceIndex
+    └─> stream_: optional<cudaStream_t>
+
+
+BlockComparatorSize (块比较器)
+用于std::set排序:
+  • 先比较大小 (size)
+  • 再比较地址 (ptr)
+  • 确保lower_bound能找到最小满足的块
+```
+
 ### 3.1 Block (内存块)
 
 **文件:** `c10/cuda/CUDACachingAllocator.cpp:185-249`
@@ -424,6 +675,140 @@ class DeviceCachingAllocator {
 ---
 
 ## 四、内存分配策略
+
+### 4.0 内存分配决策树
+
+```
+用户请求分配 size 字节
+    │
+    ↓
+┌─────────────────────────────────────────────────┐
+│ [1] 对齐大小: round_size(size) -> 512字节对齐   │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────┐
+│ [2] 选择池: get_pool(size, stream)              │
+│  ┌───────────────────────────────────────┐      │
+│  │ CUDA Graph捕获中?                     │      │
+│  │   YES: graph_pools[mempool_id]        │      │
+│  │   NO:  size ≤ 1MB ? small : large     │      │
+│  └───────────────────────────────────────┘      │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────┐
+│ [3] 查找空闲块: get_free_block()                │
+│  ┌───────────────────────────────────────┐      │
+│  │ pool.blocks.lower_bound(size)         │      │
+│  │   • 找到 >= size 的最小块             │      │
+│  │   • 检查 stream 是否匹配              │      │
+│  │   • 避免浪费过大的块                  │      │
+│  └───────────────────────────────────────┘      │
+│                                                   │
+│  找到? ──YES──> [跳到步骤7]                      │
+│    │                                              │
+│    NO                                             │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────┐
+│ [4] 垃圾回收: garbage_collect_cached_blocks()   │
+│  ┌───────────────────────────────────────┐      │
+│  │ 触发条件:                             │      │
+│  │   total_memory > gc_threshold         │      │
+│  │                                        │      │
+│  │ 回收策略:                             │      │
+│  │   • 只回收未拆分的块                  │      │
+│  │   • 按年龄排序                        │      │
+│  │   • 释放超过平均年龄的块              │      │
+│  │   • 目标: 降到阈值以下                │      │
+│  └───────────────────────────────────────┘      │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────┐
+│ [5] 分配新块: alloc_block()                     │
+│                                                   │
+│  检查内存限制?                                   │
+│    total + size > allowed_max ──YES──> 失败     │
+│    │                                              │
+│    NO                                             │
+│    ↓                                              │
+│  ┌─────────────────────────────────────┐        │
+│  │ 可扩展段模式?                       │        │
+│  │   YES:                              │        │
+│  │    try_allocate_expandable_block()  │        │
+│  │      ├─> 查找或创建可扩展段         │        │
+│  │      ├─> map(size): 映射物理内存    │        │
+│  │      │    └─> cuMemCreate + cuMemMap │        │
+│  │      └─> 合并相邻块                 │        │
+│  │                                      │        │
+│  │   NO:                                │        │
+│  │    cudaMallocMaybeCapturing(size)   │        │
+│  │      └─> 传统cudaMalloc             │        │
+│  └─────────────────────────────────────┘        │
+│                                                   │
+│  成功? ──YES──> [跳到步骤7]                      │
+│    │                                              │
+│    NO                                             │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────┐
+│ [6] 重试策略:                                    │
+│  ┌───────────────────────────────────────┐      │
+│  │ 尝试1: release_available_cached_blocks│      │
+│  │   • 释放部分不在分割的缓存块          │      │
+│  │   • 重新调用 alloc_block()            │      │
+│  └───────────────────────────────────────┘      │
+│         │                                         │
+│      失败? ──NO──> [跳到步骤7]                   │
+│         │                                         │
+│        YES                                        │
+│         ↓                                         │
+│  ┌───────────────────────────────────────┐      │
+│  │ 尝试2: release_cached_blocks()        │      │
+│  │   • 释放所有缓存块                    │      │
+│  │   • 重新调用 alloc_block()            │      │
+│  └───────────────────────────────────────┘      │
+│         │                                         │
+│      失败? ──NO──> [跳到步骤7]                   │
+│         │                                         │
+│        YES                                        │
+│         ↓                                         │
+│  ┌───────────────────────────────────────┐      │
+│  │ 尝试3: 从私有池借用                   │      │
+│  │   • 遍历 graph_pools                  │      │
+│  │   • 尝试从空闲的私有池分配            │      │
+│  └───────────────────────────────────────┘      │
+│         │                                         │
+│      失败? ──YES──> OOM异常                      │
+│         │                                         │
+│        NO                                         │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────┐
+│ [7] 拆分块: should_split(block, size)           │
+│  ┌───────────────────────────────────────┐      │
+│  │ block.size > size + kMinBlockSize?    │      │
+│  │   YES:                                 │      │
+│  │     • 创建 remaining_block             │      │
+│  │     • remaining.size = block.size-size │      │
+│  │     • remaining.ptr = block.ptr + size │      │
+│  │     • pool.insert(remaining)           │      │
+│  │     • block.size = size                │      │
+│  │   NO:                                  │      │
+│  │     • 保持原块大小 (避免过度拆分)     │      │
+│  └───────────────────────────────────────┘      │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────┐
+│ [8] 标记分配:                                    │
+│   • block.allocated = true                       │
+│   • block.requested_size = orig_size             │
+│   • active_blocks.insert(block)                  │
+│   • 更新统计信息                                 │
+│   • record_trace(ALLOC)                          │
+└─────────────────────┬───────────────────────────┘
+                      ↓
+                  返回 block->ptr
+```
 
 ### 4.1 池选择策略
 
@@ -1121,6 +1506,111 @@ GC 时:
 
 ## 六、跨流使用与事件同步
 
+### 6.0 跨流同步机制流程图
+
+```
+场景: Block在stream1分配, 在stream2使用
+
+时间线:
+────────────────────────────────────────────────────────────>
+
+[T1] 在stream1分配
+     ↓
+     Block.stream = stream1
+     Block.stream_uses = {}
+     Block.allocated = true
+
+
+[T2] 在stream2使用 (用户调用 record_stream)
+     ↓
+     x.record_stream(stream2)
+     ↓
+     ┌─────────────────────────────────────────┐
+     │ recordStream(block, stream2)            │
+     │   • Block.stream_uses.insert(stream2)   │
+     └─────────────────────────────────────────┘
+
+
+[T3] 用户释放Block (del x)
+     ↓
+     free(block)
+     ↓
+     ┌──────────────────────────────────────────────┐
+     │ [1] block.allocated = false                  │
+     │ [2] 从active_blocks移除                      │
+     │ [3] 更新统计信息                             │
+     └──────────────────────┬───────────────────────┘
+                            ↓
+     ┌──────────────────────────────────────────────┐
+     │ stream_uses非空? (有跨流使用)               │
+     │   YES:                                       │
+     │     insert_events(block)                     │
+     │       ├─> 为每个stream创建cudaEvent          │
+     │       ├─> cudaEventRecord(event, stream2)    │
+     │       ├─> cuda_events[stream2].push(event,   │
+     │       │                            block)     │
+     │       └─> block.event_count++                │
+     │                                               │
+     │     暂不归还缓存池 (等待事件完成)            │
+     │                                               │
+     │   NO:                                        │
+     │     free_block(block)                        │
+     │       └─> pool.blocks.insert(block)          │
+     │           (立即归还缓存池)                   │
+     └──────────────────────────────────────────────┘
+
+
+[T4] 下次分配时 (任意设备, 任意stream)
+     ↓
+     malloc(...)
+     ↓
+     process_events()  ← 检查所有待处理事件
+     ↓
+     ┌──────────────────────────────────────────────┐
+     │ 遍历 cuda_events:                            │
+     │   for (stream, event_queue) in cuda_events:  │
+     │     for (event, block) in event_queue:       │
+     │       ├─> cudaEventQuery(event)              │
+     │       │                                       │
+     │       ├─> 完成 (cudaSuccess):                │
+     │       │     • block.event_count--            │
+     │       │     • 移除事件                       │
+     │       │     • event_count == 0?              │
+     │       │        YES: free_block(block)        │
+     │       │             归还缓存池                │
+     │       │                                       │
+     │       └─> 未完成 (cudaErrorNotReady):        │
+     │             • 保留事件                       │
+     │             • break (停止处理此stream)       │
+     └──────────────────────────────────────────────┘
+
+
+跨流使用安全示例:
+
+stream1: ──alloc(x)──────────────────free(x)──────>
+           [addr]                    [释放请求]
+
+stream2: ─────────────use(x)──────────────────────>
+                      [访问addr]
+
+         ↑                ↑             ↑
+         T1               T2            T3
+
+cudaEvent:              record         query
+                      (在stream2)    (检查完成)
+
+结果: 只有stream2完成对x的使用后, x才会归还缓存池
+
+
+内存安全保证:
+
+1. 同stream分配和释放: 无需事件, 直接复用 (FIFO顺序保证)
+2. 跨stream使用: 通过cudaEvent同步
+   • 释放时记录事件
+   • 分配时检查事件完成
+   • 未完成的块不可见
+```
+
 ### 6.1 问题
 
 ```python
@@ -1323,6 +1813,177 @@ void process_events(const std::shared_ptr<GatheredContext>& context) {
 ---
 
 ## 七、CUDA Graph 支持
+
+### 7.0 CUDA Graph 私有池机制
+
+```
+问题: CUDA Graph需要固定的内存地址
+
+用户代码:
+┌─────────────────────────────────────────┐
+│ g = torch.cuda.CUDAGraph()              │
+│ with torch.cuda.graph(g):               │
+│   x = torch.empty(1000, device='cuda')  │
+│   # 记录地址: 0x7f00_1000              │
+│   y = x + 1                             │
+│                                          │
+│ g.replay()  # x必须仍在0x7f00_1000      │
+└─────────────────────────────────────────┘
+
+挑战:
+  缓存分配器会复用内存 → 地址可能变化
+  如何保证重放时地址不变?
+
+
+解决方案: 私有池 (Private Pool)
+
+┌─────────────────────────────────────────────────────────┐
+│ DeviceCachingAllocator                                  │
+│                                                          │
+│  常规池 (共享)                                          │
+│  ├─> small_blocks                                       │
+│  └─> large_blocks                                       │
+│                                                          │
+│  私有池 (每个Graph独立)                                 │
+│  └─> graph_pools: map<MempoolId_t, PrivatePool*>       │
+│       ├─> [graph_1_id] -> {small_blocks, large_blocks} │
+│       ├─> [graph_2_id] -> {small_blocks, large_blocks} │
+│       └─> [graph_3_id] -> {small_blocks, large_blocks} │
+│                                                          │
+│  捕获状态跟踪                                           │
+│  └─> captures_underway: [(mempool_id, stream_filter)]  │
+└─────────────────────────────────────────────────────────┘
+
+
+完整生命周期:
+
+[阶段1] 开始捕获
+        ↓
+┌──────────────────────────────────────────────┐
+│ torch.cuda.graph._begin_capture()            │
+│   • 生成 mempool_id                          │
+│   • 创建 PrivatePool(mempool_id)             │
+│   • captures_underway.push(mempool_id,       │
+│                             stream_filter)   │
+│   • graph_pools[mempool_id] = new_pool       │
+└──────────────────────────────────────────────┘
+
+
+[阶段2] 捕获期间的分配
+        ↓
+┌──────────────────────────────────────────────┐
+│ x = torch.empty(..., device='cuda')          │
+│   ↓                                           │
+│ malloc(size, stream)                         │
+│   ↓                                           │
+│ get_pool(size, stream)                       │
+│   ├─> 检查 captures_underway                 │
+│   ├─> stream_filter 匹配?                    │
+│   │     YES:                                 │
+│   │       返回 graph_pools[mempool_id]       │
+│   │         -> small_blocks / large_blocks   │
+│   │     NO:                                  │
+│   └─>     返回常规池                         │
+│                                               │
+│ 结果: 捕获的分配使用私有池                   │
+└──────────────────────────────────────────────┘
+
+
+[阶段3] 结束捕获
+        ↓
+┌──────────────────────────────────────────────┐
+│ torch.cuda.graph._end_capture()              │
+│   • captures_underway.erase(mempool_id)      │
+│   • graph_pools[mempool_id] 保留             │
+│   • use_count = 1                            │
+└──────────────────────────────────────────────┘
+
+
+[阶段4] 重放
+        ↓
+┌──────────────────────────────────────────────┐
+│ g.replay()                                   │
+│   • 执行记录的CUDA操作                       │
+│   • 访问私有池中的固定地址                   │
+│   • 私有池内存不会被常规分配复用             │
+└──────────────────────────────────────────────┘
+
+
+[阶段5] 销毁图
+        ↓
+┌──────────────────────────────────────────────┐
+│ del g  或  g.reset()                         │
+│   ↓                                           │
+│ releasePool(mempool_id)                      │
+│   ├─> graph_pools[mempool_id]->use_count--   │
+│   │                                           │
+│   ├─> use_count == 0?                        │
+│   │     YES:                                 │
+│   │       • 标记为可释放                     │
+│   │       • graph_pools_freeable[id] = pool  │
+│   │       • 用户可手动调用                   │
+│   │         empty_cache() 释放               │
+│   │     NO:                                  │
+│   └─>     • 仍有引用, 保持池                │
+└──────────────────────────────────────────────┘
+
+
+内存隔离示例:
+
+时间线:
+────────────────────────────────────────────────────>
+
+T1: 开始捕获
+    captures_underway = [graph_1_id]
+
+T2: 捕获中分配
+    x = torch.empty(100, device='cuda')
+    → 从 graph_pools[graph_1_id].small_blocks 分配
+    → 地址: 0x7f00_1000
+
+T3: 结束捕获
+    captures_underway = []
+    graph_pools[graph_1_id] 保留
+
+T4: 常规分配 (不在捕获中)
+    y = torch.empty(100, device='cuda')
+    → 从 small_blocks (常规池) 分配
+    → 地址: 0x7f10_2000  (不同地址空间)
+
+T5: 重放图
+    g.replay()
+    → 访问 0x7f00_1000  (仍然有效)
+
+T6: 释放常规内存
+    del y
+    → 只归还到常规池
+    → graph_pools[graph_1_id] 不受影响
+
+
+多图场景:
+
+graph_pools:
+  ├─> [graph_A] -> 私有池A
+  │      └─> 10MB 内存 (地址段A)
+  │
+  ├─> [graph_B] -> 私有池B
+  │      └─> 5MB 内存 (地址段B)
+  │
+  └─> [graph_C] -> 私有池C
+         └─> 8MB 内存 (地址段C)
+
+常规池:
+  └─> 100MB 内存 (地址段D)
+
+完全隔离, 互不干扰
+
+
+性能优化:
+
+1. 同一图多次重放: 私有池内存始终可用, 无需重新分配
+2. use_count 引用计数: 共享图时自动管理
+3. 可选释放: 用户可选择何时释放不再使用的图的内存
+```
 
 ### 7.1 问题
 
@@ -1594,6 +2255,201 @@ if after > before:
 ---
 
 ## 十、总结
+
+### 10.0 完整内存管理流程图
+
+```
+═══════════════════════════════════════════════════════════════════════
+                        PyTorch CUDA 显存管理全景图
+═══════════════════════════════════════════════════════════════════════
+
+用户操作: torch.empty(size, device='cuda')
+    │
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│                      Python 层调度                                 │
+│  torch.cuda.memory.caching_allocator_alloc()                       │
+│    └─> torch._C._cuda_cudaCachingAllocator_raw_alloc()            │
+└───────────────────────────┬───────────────────────────────────────┘
+                            ↓ (释放GIL)
+┌───────────────────────────────────────────────────────────────────┐
+│              C++ 全局分配器 (NativeCachingAllocator)              │
+│  • 管理所有GPU设备                                                 │
+│  • allocated_blocks: 全局Block索引 (67分片hash map)               │
+│  • device_allocator[device] -> DeviceCachingAllocator             │
+└───────────────────────────┬───────────────────────────────────────┘
+                            ↓
+┌───────────────────────────────────────────────────────────────────┐
+│         设备分配器 (DeviceCachingAllocator::malloc)               │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │ [1] 事件处理: process_events()                           │    │
+│  │     • 检查cuda_events中所有待处理的cudaEvent             │    │
+│  │     • 完成的事件 → 归还Block到缓存池                     │    │
+│  │     • 回收跨流使用的内存                                 │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                            ↓                                        │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │ [2] 池选择: get_pool(size, stream)                       │    │
+│  │     ┌────────────────────────────────────────┐           │    │
+│  │     │ CUDA Graph捕获中?                      │           │    │
+│  │     │   YES: graph_pools[mempool_id]         │           │    │
+│  │     │   NO:  size≤1MB? small_blocks          │           │    │
+│  │     │               :  large_blocks           │           │    │
+│  │     └────────────────────────────────────────┘           │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                            ↓                                        │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │ [3] 缓存查找: get_free_block()                           │    │
+│  │     • pool.blocks.lower_bound(size) - 最小满足           │    │
+│  │     • stream匹配检查                                     │    │
+│  │     • 避免浪费过大块                                     │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│         │                                │                         │
+│     找到 Block                        未找到                      │
+│         │                                │                         │
+│         │                                ↓                         │
+│         │     ┌──────────────────────────────────────────┐        │
+│         │     │ [4] GC: garbage_collect_cached_blocks()  │        │
+│         │     │     • 触发条件: 超过gc_threshold         │        │
+│         │     │     • 回收策略: 按年龄释放未拆分块       │        │
+│         │     └──────────────────────────────────────────┘        │
+│         │                                │                         │
+│         │                                ↓                         │
+│         │     ┌──────────────────────────────────────────┐        │
+│         │     │ [5] 分配新块: alloc_block()              │        │
+│         │     │   ┌────────────────────────────────┐     │        │
+│         │     │   │ 可扩展段模式?                  │     │        │
+│         │     │   │  YES:                          │     │        │
+│         │     │   │   • 查找/创建ExpandableSegment │     │        │
+│         │     │   │   • cuMemCreate (物理内存)     │     │        │
+│         │     │   │   • cuMemMap (映射到虚拟地址)  │     │        │
+│         │     │   │   • 动态增长,减少碎片          │     │        │
+│         │     │   │  NO:                           │     │        │
+│         │     │   │   • cudaMallocMaybeCapturing   │     │        │
+│         │     │   │   • 传统一次性分配             │     │        │
+│         │     │   └────────────────────────────────┘     │        │
+│         │     └──────────────────────────────────────────┘        │
+│         │                │               │                         │
+│         │              成功          失败 → 重试策略               │
+│         │                │               ├─> release_available    │
+│         │                │               ├─> release_all          │
+│         │                │               └─> 从私有池借用         │
+│         │                │                         │               │
+│         │                │                      仍失败 → OOM       │
+│         │                │                                         │
+│         ↓                ↓                                         │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │ [6] 块拆分: should_split()                               │    │
+│  │     • block.size > size + kMinBlockSize?                 │    │
+│  │       YES: 拆分为 [分配块] + [剩余块]                    │    │
+│  │       NO:  直接使用整块                                  │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                            ↓                                        │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │ [7] 标记分配                                             │    │
+│  │     • block.allocated = true                             │    │
+│  │     • active_blocks.insert(block)                        │    │
+│  │     • 更新stats: allocated_bytes, active_bytes           │    │
+│  │     • record_trace(ALLOC) - 追踪历史                     │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└───────────────────────────┬───────────────────────────────────────┘
+                            ↓
+                    返回 block->ptr (GPU内存指针)
+
+
+═══════════════════════════════════════════════════════════════════════
+                           内存释放流程
+═══════════════════════════════════════════════════════════════════════
+
+用户操作: del x  或  x = None
+    │
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│              DeviceCachingAllocator::free(block)                   │
+│                                                                     │
+│  [1] 标记释放                                                      │
+│      • block.allocated = false                                     │
+│      • active_blocks.erase(block)                                  │
+│      • 更新stats: allocated_bytes, active_bytes                    │
+│                                                                     │
+│  [2] 跨流检查                                                      │
+│      ┌────────────────────────────────────────┐                   │
+│      │ block.stream_uses 非空?                │                   │
+│      │   YES: 有跨流使用                      │                   │
+│      │     • insert_events(block)             │                   │
+│      │       └─> 为每个stream创建cudaEvent    │                   │
+│      │       └─> cudaEventRecord(event)       │                   │
+│      │       └─> cuda_events[stream].push()   │                   │
+│      │     • 暂不归还缓存池                   │                   │
+│      │     • 等待process_events()检查         │                   │
+│      │                                         │                   │
+│      │   NO: 仅在分配stream使用               │                   │
+│      │     • 立即归还缓存池                   │                   │
+│      │     • free_block(block)                │                   │
+│      │       └─> pool.blocks.insert(block)    │                   │
+│      └────────────────────────────────────────┘                   │
+│                                                                     │
+│  [3] 合并相邻块 (可选)                                             │
+│      • try_merge_blocks(block, prev)                               │
+│      • try_merge_blocks(block, next)                               │
+│      • 减少碎片                                                    │
+└───────────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════
+                          关键机制速查
+═══════════════════════════════════════════════════════════════════════
+
+1. 缓存复用
+   ┌─────────────────────────────────────────┐
+   │ 释放的Block不立即归还CUDA              │
+   │ 放入缓存池 (BlockPool.blocks)          │
+   │ 下次分配时复用 → 避免cudaMalloc开销   │
+   └─────────────────────────────────────────┘
+
+2. 流感知
+   ┌─────────────────────────────────────────┐
+   │ Block记录分配的stream                  │
+   │ 只有同stream的分配才能复用             │
+   │ 跨stream使用需cudaEvent同步            │
+   └─────────────────────────────────────────┘
+
+3. 双池设计
+   ┌─────────────────────────────────────────┐
+   │ small_blocks: ≤1MB  (频繁分配)        │
+   │ large_blocks: >1MB  (大块管理)        │
+   │ 分开管理减少碎片和查找开销             │
+   └─────────────────────────────────────────┘
+
+4. 可扩展段
+   ┌─────────────────────────────────────────┐
+   │ 预留虚拟地址 (cuMemAddressReserve)    │
+   │ 按需映射物理内存 (cuMemMap)           │
+   │ 动态增长,解决批次变化导致的碎片        │
+   └─────────────────────────────────────────┘
+
+5. CUDA Graph私有池
+   ┌─────────────────────────────────────────┐
+   │ 每个Graph独立的内存池                  │
+   │ 保证重放时地址固定                     │
+   │ 与常规池完全隔离                       │
+   └─────────────────────────────────────────┘
+
+6. 垃圾回收
+   ┌─────────────────────────────────────────┐
+   │ 基于年龄的LRU策略                      │
+   │ 触发条件: 超过gc_threshold             │
+   │ 回收未拆分的老块归还CUDA               │
+   └─────────────────────────────────────────┘
+
+7. 跨流同步
+   ┌─────────────────────────────────────────┐
+   │ record_stream(): 记录跨流使用          │
+   │ cudaEvent同步确保安全                  │
+   │ process_events(): 检查事件完成         │
+   └─────────────────────────────────────────┘
+```
 
 ### 调用链路回顾
 
